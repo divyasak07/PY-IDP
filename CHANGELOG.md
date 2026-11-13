@@ -1,0 +1,911 @@
+# CHANGELOG
+
+All notable changes to py-idp are documented here. Versions follow
+[Semantic Versioning](https://semver.org/). The first number is bumped
+on breaking API changes; the second on backward-compatible features;
+the third on bugfixes.
+
+## [Unreleased] — user-facing errors, retries, and FastAPI handlers
+
+### Added
+
+* **Structured error envelope for every API error.** New `idp.errors` module
+  provides a typed hierarchy (`IDPError` and subclasses), `error_envelope()`,
+  `format_error()`, `classify_status()`, `is_transient()`, a `wrap()`
+  decorator and a `safe_call()` context manager. Each error carries a stable
+  machine-readable `code`, a `request_id`, a user-facing `hint` and a
+  `docs_url` anchor. See `USER_ERRORS.md` for the full catalog.
+* **Typed exceptions from the LLM backends.** Backend failures now raise
+  `BackendUnavailableError` / `TimeoutError_` instead of leaking raw
+  `httpx` exceptions, with the original error preserved in `__cause__`.
+* **`BatchItemResult.error_code` and `.transient`**, so batch callers can
+  route failures without parsing message strings.
+* **`tests/test_error_surface.py`** covering the classification helpers, the
+  envelope builders, the wrappers, the FastAPI exception handlers and two
+  end-to-end checks of the envelope shape.
+
+### Changed
+
+* **BREAKING (API): error responses no longer use FastAPI's `{"detail": ...}`
+  shape.** Every error now returns `{"error": {"code", "message", "type",
+  "request_id", "hint", "docs_url"}}`. Clients that read `body["detail"]`
+  must switch to `body["error"]["message"]` (or switch on
+  `body["error"]["code"]`). This includes routing 404s and HTTP exceptions,
+  which previously returned FastAPI's default body.
+
+### Fixed
+
+* `idp.errors` no longer binds the name `TimeoutError` at module level. The
+  alias shadowed the builtin for the whole module, so `is_transient()` was
+  testing against the py-idp error instead of the real `TimeoutError`, and a
+  plain `TimeoutError("timed out")` was classified as non-transient and
+  never retried.
+* `src/idp/batch.py` called an undefined `log` in six places (the module
+  logger is `_log`), raising `NameError` on every error path.
+
+## [0.6.2] — 2026-10-23 — PyYAML is now a core dependency
+
+Packaging follow-up. No API changes.
+
+### Fixed
+
+* **PyYAML was optional, but v0.6.1 made it mandatory.** Once the bundled
+  templates became the default fallback path (v0.6.1), every default install
+  parses YAML frontmatter on server startup — but PyYAML was never in
+  `[project.dependencies]`. A clean `pip install py-idp==0.6.1` followed by
+  `TemplateRegistry.load_with_fallback(...)` raised:
+
+  ```text
+  ImportError: idp.templates requires PyYAML. Install it with:
+  pip install PyYAML (or pip install py-idp[templates]).
+  ```
+
+  Found by installing the published v0.6.1 wheel into a clean virtualenv and
+  exercising the user-facing path. Local tests, wheel-content assertions, and
+  all five CI Python-version jobs had passed — none of them ran in an
+  environment without PyYAML already present.
+
+  PyYAML is now a core dependency. The import stays lazy so `import idp`
+  remains fast and never hard-fails.
+
+* **The error message pointed at a nonexistent extra.** It recommended
+  `pip install py-idp[templates]`, but no `templates = [...]` entry was ever
+  declared in `pyproject.toml`, so the suggested command could not work.
+  Declared it as a thin alias onto PyYAML so the message and any existing
+  install docs keep working.
+
+* **`load_with_fallback` degrades instead of crashing.** If PyYAML is
+  genuinely unavailable (stripped-down or vendored install), the bundled-parse
+  attempt now warns and returns an empty registry rather than propagating
+  `ImportError` and taking down server startup.
+
+### Added
+
+* Four tests in `tests/test_template_packaging.py`: PyYAML is in core
+  dependencies, the `[templates]` extra is actually declared, the fallback
+  degrades to empty when the yaml import raises, and the guard does not
+  break the normal path.
+
+## [0.6.1] — 2026-10-23 — ship the bundled document templates
+
+Packaging fix. No API changes.
+
+### Fixed
+
+* **Sample templates never shipped in the package.** The `.md` templates
+  lived at the repo root in `templates/`, outside `src/`, so
+  `[tool.setuptools.packages.find] where = ["src"]` never picked them
+  up. Verified against the actual artifacts: **0 template files** in
+  the v0.6.0 wheel and sdist, and the same for every prior release back
+  to at least v0.3.1. Anyone who ran `pip install py-idp` and pointed
+  the server at the default `./templates` got an **empty
+  `TemplateRegistry`**, despite the README advertising sample templates
+  for `invoice` / `contract` / `bank_statement` (and, since v0.5,
+  `w2` / `id_card` / `medical_claim`).
+
+  The templates now live in `src/idp/templates_pkg/` and are declared as
+  package data, so they are present in both the wheel and the sdist.
+  `TemplateRegistry.load_with_fallback()` prefers a user-supplied
+  directory when it holds `.md` files and otherwise falls back to the
+  packaged set; `api.py` startup uses it, so the server gets a working
+  registry out of the box.
+
+  `bundled_template_dir()` resolves the packaged copy via
+  `importlib.resources` and returns `None` on older Python or zip-safe
+  loaders rather than raising.
+
+### Added
+
+* `tests/test_template_packaging.py` — 10 tests, including two that
+  inspect the **built wheel and sdist** to assert all six `.md` files are
+  present. That is the assertion which would have caught the bug.
+
+### Changed
+
+* `IDP_TEMPLATE_DIR` pointing at an empty or missing directory now
+  serves the bundled defaults instead of nothing. A populated user
+  directory still wins outright. Call `TemplateRegistry.load()`
+  directly (rather than `load_with_fallback()`) if you want a strictly
+  empty registry.
+
+## [0.6.0] — 2026-10-23 — Unlimited-OCR backend
+
+Adds `baidu/Unlimited-OCR` (Baidu, arXiv 2606.23050) as a parallel
+self-hosted OCR backend. Differentiation over Nanonets-OCR2-3B: 32K
+context, constant KV cache via Reference Sliding Window Attention (R-SWA),
+and a native `infer_multi()` API for dozens-of-pages-in-one-forward-pass.
+MIT-licensed. Expected 5-10× wall-time improvement on ≥10-page documents,
+plus cross-page reasoning (e.g. "see appendix A" actually reads the
+appendix).
+
+### Added
+
+* **`UnlimitedOcrBackend`** — `src/idp/llm/unlimited_ocr.py`. Mirrors
+  `NanonetsVLBackend` shape: gated behind `IDP_ENABLE_UNLIMITED_OCR=1`,
+  lazy load, multimodal, platform-aware. Uses the model's native
+  `model.infer()` (single image, gundam mode) and `model.infer_multi()`
+  (multi-page, base mode) entry points. When `Message.images_b64` carries
+  more than one image, `_infer_multi` is called; otherwise `_infer_single`.
+  `<|det|>region_type [bbox]<|/det|>` markup is stripped from the output
+  so the downstream JSON extraction pipeline sees clean text.
+* **Wired into `get_backend("unlimited-ocr")` and `list_backends()`** —
+  same gated-registration pattern as `nanonets`. Reuses the existing
+  `[hf-vlm]` extra (no new pip dependencies).
+* **`tests/test_unlimited_ocr_backend.py`** — 28 tests covering gating,
+  lazy load, image extraction, infer vs infer_multi routing, marker
+  stripping, device resolution, dtype validation, 4-bit quantization,
+  recursive output-file discovery, and the helpful ImportError when
+  torch/transformers are missing.
+* **`tests/test_version_consistency.py`** — 4 tests pinning
+  `pyproject.toml`, `src/idp/__init__.py`, and `CITATION.cff` to the same
+  version string. Prevents the drift that shipped v0.5.0 with
+  `idp.__version__ == "0.4.0"`.
+
+### Fixed
+
+* **`_resolve_dtype` raised a bare `KeyError`** on an unrecognized
+  `dtype=` value. Now raises `ValueError` naming the accepted choices,
+  matching the clear-message pattern used elsewhere in the file.
+* **`_read_output_text` used a non-recursive glob**, so a model version
+  writing per-page output into a subdirectory would silently return
+  empty text (the pipeline then extracted nothing, with no error). Now
+  uses `rglob()` with an `is_file()` guard.
+* **`_infer_text_only` renamed to `_infer_synthetic_placeholder`.** The
+  model has no text-only entry point — every documented path requires an
+  image — so the old name implied behavior that does not exist.
+* **Version drift** — `src/idp/__init__.py` sat at `0.4.0` while
+  `pyproject.toml` was at `0.5.0`, so `pip install py-idp==0.5.0` then
+  `idp.__version__` reported the wrong number. `CITATION.cff` was staler
+  still (`0.3.1.post1`). All three now read `0.6.0`.
+
+### Reuses
+
+* `[hf-vlm]` extra (no new pip dependencies; the Unlimited-OCR
+  `trust_remote_code` model and Nanonets share identical deps: `torch`,
+  `transformers`, `accelerate`, `safetensors`, `Pillow`,
+  `huggingface-hub`)
+* Existing `idp.llm.Backend` ABC and `is_multimodal` contract
+* `Message.images_b64: list[str]` field for image attach
+* `_safe_json` downstream parser (works on the marker-stripped text)
+
+### Security
+
+Unlimited-OCR ships **custom code** (DeepSeek-OCR-2 base + R-SWA decoder)
+loaded with `trust_remote_code=True`. This is standard practice for
+cutting-edge open-weights models but does mean the `modeling_*.py`
+files from the repo are executed in your Python process. Review the
+upstream code if this is a concern; users who prefer not to run the
+custom code can deploy via the SGLang-server path and use a plain
+OpenAI-compat client instead (separate backend, out of scope for v0.6).
+
+## [0.5.0] — Unreleased — multi-track enhancements
+
+Four independent feature tracks landed in one PR, each with its own
+tests and a backward-compatible contract. Headline: **"more backends,
+more doc types, async, eval CI gate."**
+
+### Added
+
+* **5 international LLM provider backends** — `src/idp/llm/international.py`.
+  `Groq`, `Mistral`, `Together AI`, `Cohere`, and `Fireworks` join the
+  existing `OpenAI` / `Anthropic` / `Ollama` line-up. Each is registered
+  via a `INTERNATIONAL_PROVIDER_PRESETS` dict (mirroring the
+  `CHINA_PROVIDER_PRESETS` pattern) and resolved through
+  `get_backend("intl:groq" | "intl:mistral" | "intl:together" |
+  "intl:cohere" | "intl:fireworks")`. All speak the OpenAI
+  Chat-Completions protocol, so they share `OpenAICompatBackend` under
+  the hood. Multimodal variants are picked automatically when you
+  pass `multimodal=True`. Total registered backends: **23** (was 18).
+  Tested via `tests/test_international_providers.py` (6 tests).
+
+* **`list_backends()` registry helper** — `src/idp/llm/backend.py`.
+  Returns a list of `{"name", "family", "auth"}` dicts covering every
+  registered backend. Gated backends (`slowmock`, `nanonets`) are
+  surfaced only when their `IDP_ENABLE_*` env var is set. Useful for
+  CLI help screens, config validation, and tests that assert the
+  registry's coverage. Re-exported from `idp.llm`.
+  Tested via `tests/test_backend_registry_helpers.py` (10 tests).
+
+* **`Backend.__repr__`** — `src/idp/llm/backend.py`. Every backend now
+  prints as `<ClassName name='...'>`, making logs and debugger
+  sessions far less opaque. Subclasses can override for richer
+  state (model, base_url, key presence).
+
+* **3 new built-in document types** — `src/idp/core/schemas.py`:
+  - `W2` (US IRS wage and tax statement) with `W2LineItem`
+  - `IDCard` (driver's license / passport / state ID)
+  - `MedicalClaim` (CMS-1500 / UB-04) with `MedicalClaimLineItem`
+
+  All three ship with corresponding Markdown templates in
+  `templates/w2.md`, `templates/id_card.md`, `templates/medical_claim.md`
+  (frontmatter + field descriptions + "Common mistakes" section, same
+  shape as the existing `invoice.md` / `contract.md` / `bank_statement.md`).
+  Registered in `SCHEMA_REGISTRY` so `Pipeline(schema="W2")`,
+  `extract_one("w2.pdf", schema="W2")`, and template auto-discovery
+  all work out of the box.
+  Tested via `tests/test_new_schemas.py` (11 tests).
+
+* **Async pipeline layer** — `src/idp/pipeline/async_pipeline.py`.
+  New `AsyncPipeline` class wraps the existing `Pipeline` so you can
+  `await apipe.arun(doc)` and `await apipe.arun_many(docs)`. All
+  existing backends transparently support async via a new
+  `Backend.acomplete()` method that defaults to
+  `asyncio.to_thread(self.complete, req)` — so zero risk to
+  existing code, and backends with a native async client
+  (`openai.AsyncOpenAI`, `anthropic.AsyncAnthropic`) can override
+  later for better performance.
+
+* **Async batch helper** — `src/idp/batch.py::process_batch_async`.
+  Same surface as the existing sync `process_batch` but with a
+  bounded `concurrency=` semaphore (default 4), an optional
+  `on_progress(done, total)` callback, and structured error capture
+  in `BatchItemResult.success` / `.latency_s` fields.
+  Tested via `tests/test_async_pipeline.py` (14 tests).
+
+* **Per-field accuracy report in eval harness** — `src/idp/eval/runner.py`.
+  `run_dataset()` now additionally returns `per_field_accuracy`:
+  a dict of `{field_name: {"match": int, "total": int, "accuracy": float}}`
+  aggregated across all cases × all strategies. Backward-compatible —
+  existing `rows` / `detail` / `dataset` / `strategies` keys are
+  preserved. Tested via `tests/test_eval_regression.py` (12 tests).
+
+* **Regression-threshold gate for CI** — `src/idp/eval/runner.py`.
+  New `check_regression(results, thresholds)` returns a list of
+  failing threshold descriptions, plus a `verify_against_thresholds`
+  convenience wrapper that raises `EvalRegressionError`. Threshold
+  grammar: `per_strategy.<name>.<metric>` and
+  `per_field_accuracy.<field>.<metric>`. Use this in CI: empty
+  list = green, non-empty = fail the build.
+
+* **`format_report(results)`** — `src/idp/eval/runner.py`.
+  Plain-text pretty-printer for eval results, suitable for
+  `print()` in CLI output or test assertions. No external table
+  library.
+
+### Changed
+
+* `BatchItemResult` gained two new optional fields: `success: bool`
+  and `latency_s: float`, kept consistent with the existing `ok` /
+  `elapsed_seconds` via a `__post_init__` reconciler. Sync callers
+  that construct `BatchItemResult(path=..., result=..., ...)` still
+  work — the new fields default and reconcile transparently.
+
+### Test coverage
+
+* **+53 new tests** (6 + 10 + 11 + 12 + 14) across 5 new test files.
+* **All 984 existing tests still pass** (2 skipped — pre-existing
+  `test_enhance_benchmark.py` requires the `pytest-benchmark` plugin
+  which is not in the dev environment).
+* `python -c "import idp"` still works.
+
+## [0.4.0] — 2026-09-21 — v0.4 plan complete
+
+The v0.4 plan recorded in `docs/ROADMAP_v0.4.md` ships in this release.
+Five PRs landed (#37, #38, #39, #40, #41), each independently tested
+and reviewable. Headline: **"much easier setup, still need accuracy."**
+
+### Added
+
+* **`TieredBackend` (v0.4 P2)** — `src/idp/llm/tiered.py`. A drop-in
+  `Backend` subclass that routes every `complete()` call to a cheap
+  local model first and only escalates to an expensive model when
+  the cheap response fails JSON validation or has per-field
+  confidence below `ambiguity_threshold` (default 0.7, per the D2
+  spec). Raises `TieredBackendExhaustedError` with both raw outputs
+  attached if both tiers fail. Existing `Pipeline` callers see no
+  change — assign `Pipeline(backend=TieredBackend(...))` and go.
+  Tested via `tests/test_tiered.py` (14 tests).
+* **`OllamaBackend` (v0.4 P2)** — `src/idp/llm/ollama.py`. Thin
+  `Backend` subclass over the local Ollama HTTP API at
+  `http://localhost:11434`. Uses `httpx` (already a core dep),
+  no `ollama` SDK required. Honors `OLLAMA_MODEL` and `OLLAMA_HOST`
+  env vars; `is_multimodal` is True for vision-capable tags.
+  `get_backend("ollama")` now resolves to this class instead of
+  `OpenAICompatBackend` (Ollama speaks its own `/api/chat` shape).
+  Tested via `tests/test_ollama_backend.py` (15 tests, all using a
+  mocked `httpx.MockTransport`).
+* **`examples/06_tiered_pipeline.py`** — the headline v0.4 cost win
+  example: `TieredBackend(OllamaBackend(), AnthropicBackend())` in
+  one `Pipeline` setup.
+* **`tests/test_tiered.py`** (14 tests) — covers routing-to-cheap,
+  escalation on low-confidence / parse-failure, threshold-boundary
+  behaviour, both-tiers-exhausted error contract, pipeline
+  configuration and defensive constructor validation.
+* **`tests/test_ollama_backend.py`** (15 tests) — covers the wire
+  shape, response parsing, error surfaces, env-var resolution, and
+  multimodal tag detection — all against a mocked `httpx.MockTransport`.
+
+* **Example notebooks (v0.4 P1)** — `examples/notebooks/`. Three
+  executed Jupyter notebooks walk through py-idp end-to-end with
+  the in-tree `MockBackend` (no API key required):
+  - `01_pipeline_minimal.ipynb` (5-min tour, 11 cells)
+  - `02_hitl_loop.ipynb` (HITL feedback loop, 11 cells)
+  - `03_batch.ipynb` (30-doc batch + DataFrame + checkpoint
+    resume, 19 cells — also covers the v0.4 direction D3
+    `BatchItemResult` workflow)
+  Each notebook ships with real output cells so GitHub renders
+  numbers, not blank blocks. `pyproject.toml` adds a `[notebooks]`
+  extra (`nbformat` + `nbconvert` + `ipykernel` + `pandas`) for users
+  who want to re-execute them. Ruff config excludes `*.ipynb` (cells
+  have import quirks that don't fit module-level lint).
+
+* **`idp hitl triage` (v0.4 P3 + D1)** — `src/idp/hitl/triage.py`.
+  A pure module (no Streamlit) exposing `triage(storage, *,
+  min_reviews=3, threshold=0.6) -> TriageReport`. Walks reviewed
+  `StoredResult`s, partitions fields into `.systematic_errors`
+  (correction rate ≥ threshold AND n ≥ min_reviews) and
+  `.insufficient` (the honest "needs N more reviews" bucket).
+  CLI: `idp triage --storage <path> [--min-reviews 3] [--threshold
+  0.6] [--output json|md]`. Streamlit "Triage" page reachable from
+  the sidebar in the existing `idp serve` UI. Tested via
+  `tests/test_triage.py` (21 tests).
+
+* **HITL UX polish (v0.4 P3 + C3)** — `src/idp/hitl/app.py`. Additive:
+  the review-queue view gains a side-by-side field view (model
+  output | human-edited with pre-populated widget), a bulk-accept
+  button at ≥ 0.9 confidence (calls `save_review` with unchanged
+  extraction on high-confidence fields), a skip button (non-persistent
+  close), a per-document confidence histogram (`st.bar_chart`),
+  and a keyboard-shortcut help expander. The Triage page is
+  reachable from the sidebar. All existing review behaviour
+  unchanged. Tested via 6 new AppTest smoke tests.
+
+* **CORD baseline eval (v0.4 P4 + C2)** — `src/idp/eval/datasets/cord/`.
+  30 synthetic-but-faithful receipts (matching the CORD schema and
+  license — CC-BY-2020, the `cord2020` paper), `manifest.json` with
+  ground-truth extraction per doc, verbatim `LICENSE.txt` and
+  `ATTRIBUTION.md`. New CLI helper `tests/eval_cord/update_baseline_doc.py`
+  regenerates `docs/eval/BASELINE.md` (the per-field precision/recall/F1
+  table). Slow-marked `tests/eval_cord/test_eval_real_dataset.py`
+  runs against a real backend when `IDP_USER_ID=ollama|anthropic|openai`
+  is set. MockBackend baseline is intentionally near zero (no real
+  model calls happen) — the doc gives users a starting point to
+  re-run against their own backend.
+
+* **Template-version migration (v0.4 P5 + C4)** — `src/idp/migrate.py`.
+  Exposes `migrate_template_version(storage, template_name, *,
+  from_version, to_version, pipeline_factory, output_path=None,
+  dry_run=True) -> MigrationReport`. Reuses `process_batch` plumbing.
+  Default is dry-run (does not mutate the source schema); `--commit`
+  flag persists new extractions as fresh v2 `StoredResult`s while v1
+  records stay intact. Per-field diff (`added` / `removed` /
+  `changed` / `unchanged`). CLI: `idp migrate-template --storage
+  <back> --template-name <name> --from-version <v1> --to-version
+  <v2> [--dry-run] [--commit] [--output FILE]`. Tested via
+  `tests/test_migrate_template.py` (10 unit tests + 1 slow e2e test
+  against CORD fixtures).
+
+* **`pyproject.toml` `[notebooks]` extra** — `nbformat>=5.10`,
+  `nbconvert>=7.0`, `ipykernel>=6.0`, `pandas>=2.1`. Install with
+  `pip install py-idp[notebooks]` to re-execute the example
+  notebooks.
+
+* **`pyproject.toml` `slow` pytest marker** — registered for tests
+  that require a real backend (CORD baseline, CORD migration e2e).
+  Skipped in default CI; run with `pytest -m slow`.
+
+* **Breaking: `get_backend("ollama")` now returns `OllamaBackend`** —
+  previously returned `OpenAICompatBackend` (Ollama was treated as
+  OpenAI-compatible). Ollama's native `/api/chat` shape is materially
+  different, so v0.4 routes it through the dedicated class. Users
+  who relied on the OpenAI-compat behaviour should switch to
+  `get_backend("compat")` with `OLLAMA_OPENAI_COMPAT=true` (or
+  whatever env var the OpenAI-compatible server expects). Safe
+  because v0.3.x was never published to PyPI.
+
+### Not in v0.4 (explicit non-goals, deferred to v0.5)
+
+* Ollama streaming response handling (`stream=true`).
+* Per-field confidence escalation (only the whole-response
+  acceptance test is in v0.4).
+* Rule-based / regex pre-pass as a third tier ahead of the cheap
+  LLM.
+* Tiered caching (re-run the cheap tier vs serve from cache) — for
+  v0.4 compose TieredBackend with the existing
+  `idp.reliability.CachingBackend` instead.
+* Per-template triage report (today: one triage report across all
+  schemas).
+* LLM-based confidence overrides (triage uses stored `confidence`
+  as-is; no inference).
+* Automatic field-correction (no `save_review` writes happen from
+  the triage tool).
+* Statistical significance testing on triage (threshold-based, not
+  p-value).
+* Full-feedback-loop-aware migration (v0.4 is raw-extraction only).
+* Per-template baselines (each schema gets its own baseline
+  numbers).
+* Automated regression gating on the CORD baseline (drift
+  threshold TBD).
+* The original ~1000 real CORD receipts (manifest format is
+  forward-compatible; a v0.5 PR can swap them in).
+* Per-template CORD baseline coverage (multi-class document types
+  — FUNSD forms, CUAD contracts — all deferred).
+
+## [0.3.8] — 2026-09-17 — coverage push to 92%, PIL 10+ bug fix
+
+### Fixed
+
+* **`NanonetsVLBackend._preprocess` crashed on PIL 10+** — used
+  `image.LANCZOS` which was removed from PIL Image instances in v10.
+  Result: `_extract_images` returned `[]` for any image with a long
+  edge > `max_image_side` (silently dropped, no error surfaced).
+  Fixed by trying `Image.Resampling.LANCZOS` first, then `Image.LANCZOS`
+  (older PIL), falling back to `Image.BICUBIC`. Found via the new
+  `_preprocess_resize_when_too_large` test.
+
+### Added
+
+* **`hitl/app.py` smoke coverage: 48% → 87%** — 12 tests in
+  `tests/test_hitl_app_smoke.py` driving Streamlit's `AppTest`
+  harness through sidebar metrics, queue/history/About pages, and
+  the page navigation paths.
+* **`llm/nanonets.py` mock coverage: 61% → 64%** — 21 tests pinning
+  `_build_prompt`, `_extract_images`, `_clean_json`, `_preprocess`,
+  `_require_deps`, and the `complete()` text-only vs multimodal
+  path dispatch.
+* **Property-based tests** for `_perturb_json`, `_omit_fields`,
+  `_empty_schema` — 13 new tests using Hypothesis.
+* **CI coverage gate** — `.github/workflows/tests.yml` now runs
+  `pytest --cov-fail-under=90`, so dropping coverage below 90%
+  fails CI.
+* **CHANGELOG link in README** — added link in all 3 READMEs
+  (English + 繁中 + 简中) so users can find release notes.
+
+### Tests
+
+* 792 → 836 (+44 new). Total coverage 90% → 92%.
+
+## [0.3.7] — 2026-09-17 — coverage push to 90%, HITL app smoke tests
+
+### Fixed
+
+* **`_stub()` real bug** — the previous audit's defensive guard against
+  malformed schemas (e.g. `{"type": "object", "properties": 0}`) was
+  bypassed by the `t == "object"` clause. Result: assertion failure
+  in normal mode, `AttributeError` under `python -O` (asserts stripped).
+  Combined the predicates so the object branch only runs when
+  `properties` is actually a dict. **Verified under `-O`.**
+
+### Added
+
+* **`idp.console` (public path for `pretty_print_result`)** — moved
+  out of `idp._util` (private-by-convention) into a new public module
+  with a real docstring and type hints. Old `idp._util` import keeps
+  working (re-export shim). `idp.pretty_print_result` exposed at top
+  level.
+* **`tests/test_hitl_app_smoke.py`** — 6 tests using Streamlit's
+  `AppTest` harness to smoke-test the HITL UI module
+  (`hitl/app.py` 0% → 48%). The data logic is already 100% via
+  `tests/test_hitl_review.py`.
+
+### Changed
+
+* Updated 6 example scripts to import `pretty_print_result` from
+  `idp.console` (the new public path).
+* README + CHANGELOG + pyproject version bumps 0.3.6 → 0.3.7.
+
+### Tests
+
+* 738 → 792 (+54 new). Total coverage 88% → 90%.
+
+Per-file coverage gains:
+
+| file | before | after | delta |
+|------|--------|-------|-------|
+| eval/metrics.py | 76% | 90% | +14 |
+| classify/classifier.py | 84% | 100% | +16 |
+| rl/online.py | 85% | 91% | +6 |
+| api.py | 92% | 93% | +1 |
+| storage/sql.py | 87% | 88% | +1 |
+| pipeline/pipeline.py | 92% | 99% | +7 |
+| hitl/app.py | 0% | 48% | +48 |
+| cli_sources.py | 93% | 98% | +5 (PR #24) |
+
+## [0.3.6] — 2026-09-16 — `idp batch` CLI, batch module home
+
+### Added
+
+* **`idp batch` CLI** — new command for running the pipeline over
+  many documents. Replaces the previous pattern of looping
+  `idp run` or calling `process_batch` directly. Example:
+  ```bash
+  idp batch /mnt/inbox/ --backend ollama --schema Invoice \
+            --output out.jsonl --report report.json --dlq dlq.jsonl
+  ```
+  Sources can be paths, directories (recursive scan for *.pdf /
+  *.png / *.jpg / *.tiff / *.txt), or `@<file>` (path list).
+  Produces per-doc JSONL, an aggregate summary (throughput,
+  p50/p95 latency, error histogram), and a dead-letter queue for
+  failed docs.
+
+* **`idp.process_batch` and `idp.BatchItemResult` exposed at top
+  level** — `from idp import process_batch` works directly. The
+  helper was already there; now it's discoverable at the top
+  of the package.
+
+* **`idp.cli_sources` module** — small path-collection helper
+  (`collect_paths`) used by the `idp batch` CLI, exposed for
+  scripts that want the same path-discovery behavior without
+  going through Typer.
+
+### Changed
+
+* **`idp.llm.nanonets_batch` → `idp.batch`** — the existing
+  `process_batch` helper moved to its proper home. The old path
+  is kept as a 12-line re-export shim
+  (`from idp.llm.nanonets_batch import process_batch` still
+  works). The old name was misleading — the helper works with
+  any backend, not just Nanonets.
+
+* **CI ruff strictness** — `.github/workflows/tests.yml` and the
+  local ruff now agree on F841 (unused local) and I001
+  (import-order). The batch CLI's file-handle code was
+  restructured to satisfy F841 without a `del` workaround.
+
+### Tests
+
+* 654 → 665 (+11): `tests/test_cli_batch.py` covers
+  `collect_paths` (file / dir / @file / dedup / errors) and the
+  full CLI surface (`--help`, `--dry-run`, output files,
+  missing-source exit codes).
+
+## [0.3.5] — 2026-09-15 — Tier-A roadmap fixes, Mermaid CI guard
+
+### Fixed
+
+* **`datetime.utcnow()` deprecation** — `src/idp/storage/sql.py`
+  migrated from `datetime.utcnow()` (deprecated in Python 3.12+)
+  to `datetime.now(timezone.utc)`. The naive ISO 8601 wire format
+  is preserved. Adds a regression test (`tests/test_storage_no_deprecation_warnings.py`)
+  that pins the fix and would fail if anyone reverts it. **0
+  `datetime.utcnow` deprecations from our code in CI.**
+
+* **`count_corrections` reported all fields as "corrected" for
+  unreviewed results** — `src/idp/hitl/review.py` (extracted from
+  `src/idp/hitl/app.py` as part of A3) now returns 0 when
+  `reviewed_extraction is None`. The previous behavior was
+  `n_corrections == len(extraction)`, which is nonsense for an
+  un-reviewed result. Caught by `test_count_corrections_zero_when_no_review`.
+
+* **HITL data-handling logic now unit-testable** — `idp.hitl.app`
+  was 0% covered because its logic was intertwined with the
+  Streamlit UI. Extracted into `idp.hitl/review.py` (pure, no
+  Streamlit import). The pure module is at **100% coverage** with
+  18 tests. The Streamlit app now imports the helpers; this is
+  the right factoring for a future FastAPI replacement UI.
+
+### Added
+
+* **SQLite + Postgres dialect parity tests** — `tests/test_sql_dialect.py`
+  (23 tests) covers `_parse_url` for both schemes, `_connect`
+  mocked for both, `_strip_postgres_only` for the syntax it actually
+  handles (DO `$` blocks, CREATE TYPE, review_status ENUM), and
+  schema bootstrap. Documents the current scope of
+  `_strip_postgres_only` (it does NOT strip RETURNING / ON CONFLICT
+  — those would require a real Postgres to verify safely).
+
+* **CLI test coverage 83% → 97%** — `tests/test_cli.py` now exercises
+  the actual `discover-schema` flow (not just `--help`), the
+  `--storage` URL vs path heuristic in `rl-update`, and the
+  `--synthetic without --fixtures` error in `rl-eval`. 6 new tests.
+
+* **`@mermaid-js/mermaid-cli` validation in CI** — new workflow
+  `.github/workflows/validate-mermaid.yml` runs `mmdc` on every
+  Mermaid block in the 3 READMEs and fails the build on parse
+  errors. This prevents the exact class of bug we shipped in
+  PR #15 (unquoted braces in node labels were mis-parsed as
+  diamond-shape openers, breaking the entire diagram). Renders
+  are also uploaded as artifacts for visual review.
+
+### Tests
+
+* 654 tests pass (was 613), +41 new
+* mypy clean across **61 source files** (was 60)
+* ruff clean
+* 0 `datetime.utcnow` deprecations from our code (verified with
+  `pytest -W error::DeprecationWarning`)
+
+## [0.3.4] — 2026-09-14 — Tier-1 test coverage, branch protection, CI bots
+
+### Added
+
+* **CLI test coverage** — `tests/test_cli.py` (17 tests) covers every
+  command in `idp.pipeline.cli`: `run`, `schemas`, `providers`,
+  `discover-schema`, `eval`, `rl-update`, `rl-eval`, `serve`. Brings
+  the CLI from 0% to 83% line coverage. Tests use Typer's CliRunner
+  so we exercise the actual CLI surface without subprocess overhead.
+* **`InProcessQueue` test coverage** — `tests/test_queue.py` (12 tests)
+  covers job submit/status/list, worker run/failure/recovery, and
+  start/stop idempotency. Brings `queue/jobs.py` from 0% to 97%.
+* **Eval harness test coverage** — `tests/test_eval_runner.py` (11
+  tests) covers dataset loading, schema validation, multiple
+  strategies, missing-doc skipping, and end-to-end runs against the
+  bundled invoices dataset. Brings `eval/runner.py` from 0% to 96%.
+* **Migration audit test coverage** — `tests/test_migrate_audit.py`
+  (6 tests) covers empty DB, all-compatible rows, the headline
+  case (v0.1-OK but v0.2-fails), mixed DBs, output-file writing, and
+  schema-name skipping. Brings `migrate_audit.py` from 0% to 76%.
+
+### Bots and branch protection
+
+* **Branch protection on `main`** — required status checks enforced,
+  linear history required, force-pushes disabled, branch deletion
+  disabled, conversation resolution required. Enforced for admins too,
+  so even direct pushes by the owner need a PR review.
+* **CodeQL workflow** (`.github/workflows/codeql.yml`) — weekly
+  security scan + per-PR scan using GitHub's default security-and-
+  quality query pack. Runs only on Python (no JS/TS to analyze).
+* **CI matrix expanded** — `tests.yml` now runs on Python 3.10 / 3.11
+  / 3.12 / 3.13 / 3.14 (was 3.10–3.12). Matches `pyproject.toml`'s
+  `python = ">=3.10"` declaration and includes the latest stable.
+* **CI build-artifact guard** — `tests.yml` runs a shell check at the
+  start of every CI job that fails the build if `site/` or other
+  build dirs are tracked. Mirrors the local `.githooks/pre-commit`
+  hook so PRs from forks (where the local hook isn't installed) get
+  caught too.
+* **Concurrency** — `.github/workflows/tests.yml` cancels in-progress
+  runs for the same branch when a new commit is pushed. Saves CI
+  minutes.
+
+### Tests
+
+* 46 new tests added across 4 new files. Coverage of the 4
+  user-facing modules that previously had 0% is now between 76% and
+  97%.
+
+## [0.3.3] — 2026-09-14 — Templates wire to LLM, structured error envelope, README translations
+
+### Added
+
+* **Template body now reaches the LLM** — `Pipeline(template=...)`
+  threads the template's Markdown body into every extraction call's
+  user message. Field descriptions, worked examples, and
+  common-mistakes notes from your `templates/*.md` files are prepended
+  to the prompt before the JSON Schema. The body is capped at ~2000
+  tokens to protect the 16k-context Nanonets-OCR2 budget, and is
+  included in **every** chunk call (not just the first), so multi-chunk
+  documents keep full template context throughout.
+* **`Pipeline(template="name")` + `set_template_registry(registry)`**
+  — resolve the template by name at run() time. Hot-reload works
+  transparently when the registry was loaded with `watch=True`. Missing
+  template name → logs a warning and proceeds without one.
+* **Template provenance on `Document` and `PipelineResult`** — the
+  matched template's name and version are recorded on
+  `Document.template_name` / `Document.template_version` and surfaced
+  in `PipelineResult` + `to_dict()` for audit. Answers "which template
+  version produced this row?" without re-running.
+* **Structured error envelope** — every `IDPError` subtype now carries
+  a stable machine-readable `code` (`IDP-RATE-001`, `IDP-PARSE-001`,
+  `IDP-SCHEMA-001`, `IDP-BACKEND-001`, `IDP-STORE-001`,
+  `IDP-CONF-001`, `IDP-TMPL-001`, `IDP-TMPL-404`) and an
+  `http_status`. The API's per-subtype exception handlers emit a
+  uniform JSON shape: `{"error": {"code", "message", "type",
+  "request_id", "details?"}}`. `RateLimitedError` adds a
+  `Retry-After: 60` header.
+* **`X-Request-ID` middleware** — every request gets a UUID (or
+  echoes the caller's header). Surfaces in the response header AND
+  every error envelope so client/server logs can be correlated.
+* **API endpoints for templates**:
+  * `GET /templates` — list summary (name, schema, version, patterns)
+  * `GET /templates/{name}` — full template including body
+  * `POST /extract` is now template-aware: when `schema_name` is
+    omitted, the server picks a template by filename + MIME and uses
+    its body as LLM context. The matched template is returned as
+    `template_used` in the response.
+* **Configuration** — `IDP_TEMPLATE_DIR` (default `./templates`),
+  `IDP_TEMPLATE_RELOAD` (default `false`; dev mode only).
+* **README translations** — Traditional Chinese (`README.zh-TW.md`)
+  and Simplified Chinese (`README.zh-CN.md`) at full feature parity
+  with the English version. Language switcher at the top of each
+  README.
+
+### Tests
+
+* 12 new tests in `tests/test_template_to_llm.py` cover: template
+  body reaching the LLM, template body in every chunk, hot-reload
+  between run() calls, provenance on `Document` and `PipelineResult`,
+  Pipeline API (`template=Template`, `template="name"` with
+  registry), token cap on huge bodies, missing-template fallback.
+
+## [0.3.2] — 2026-09-10 — Reliability, performance, observability, schema discovery
+
+### Added
+
+* **`Pipeline(retry=...)`** — `RetryingBackend` wraps any Backend with
+  exponential-backoff retries on transient errors. Defaults: 4 attempts,
+  1s → 2s → 4s → 8s with ±20% jitter, capped at 30s. Auth and bad-request
+  errors fail fast. See `idp.reliability.RetryConfig`.
+* **`Pipeline(cache=...)`** — `ExtractionCache` is a disk-backed SQLite
+  cache keyed by sha256 of `(schema_name, backend_name, request)`. Same
+  input → no LLM call. Default location `~/.cache/idp/extract.db`.
+  `cache.stats()` returns entries, total_hits, per-schema breakdown.
+  See `idp.reliability.ExtractionCache`.
+* **`Pipeline(cache=True, retry=True)` composes** — cache is applied
+  AFTER retry so cached hits skip the retry loop entirely.
+* **`process_batch(checkpoint=...)`** — `CheckpointStore` is an
+  append-only JSONL ledger of processed paths. Re-running with the same
+  checkpoint path skips already-done paths (idempotent). The
+  `record()` method holds an `flock` across write+flush+fsync for
+  crash-safe single-line appends. `archive_at_start=True` rotates the
+  ledger between runs (timestamped backup file). See `idp.checkpoint`.
+* **`discover_schema` — hint grounding** — `DiscoveryResult.hint_grounding`
+  is a new dict with `hint_tokens`, `schema_fields`, `grounded`
+  (list of `(hint_token, schema_field, "exact"|"fuzzy")` triples),
+  `ungrounded`, and `grounding_score` (0.0 = none of your hint tokens
+  appear, 1.0 = perfect match). When the score is below 0.5, a
+  warning is logged listing the ungrounded hint tokens. Doesn't fix
+  wrong field names — makes the wrongness observable so you know to
+  verify.
+* **`@lru_cache`-cached schema serialization** for `_build_messages()`
+  in `extract.py`. The JSON Schema dump for a Pydantic class is
+  cached per-class; only fields the LLM needs to produce output
+  (type/description/items/enum/format/required) are sent, dropping
+  `$defs`, `additionalProperties`, and other verbose fields. Measured
+  ~75-80% reduction on built-in schemas (Invoice 785 → 169 tokens).
+  For a 20-field custom schema, ~21K tokens of schema overhead per
+  13-chunk document is paid ONCE instead of N times.
+* **Token-aware text truncation** (`_truncate_to_tokens`) replaces
+  `text[:N_CHARS]` with `tiktoken`-based exact-token truncation.
+  Avoids silent budget overshoot on dense text (numbers, currency,
+  base64) where chars ~= tokens.
+* **RAM optimizations**: lazy streamlit import in `idp.hitl.app`
+  (saves ~20 MB of protobuf etc. when importing the package without
+  running the UI), `JsonFileStorage` in-memory cache (saves ~40 MB of
+  re-parsing on long batch reads), and intermediate-string cleanup
+  in `extract()`.
+
+### Changed
+
+* `MockBackend` reports `is_multimodal=True` so it works in any
+  multimodal pipeline without code changes.
+* CLI defaults to Nanonets backend when `IDP_ENABLE_NANONETS=1`;
+  explicit CLI error if not set.
+
+### Fixed
+
+* `_stub()` in `llm.backend` previously crashed on malformed JSON
+  Schema inputs like `{'properties': 0}` (int instead of dict). Now
+  defensive: falls back to returning the raw schema when no
+  recognizable structure is found. Caught by Hypothesis property
+  tests.
+* `MockBackend` can now be passed directly to `Pipeline(schema=...)`
+  via `Pipeline(backend="mock")` — was returning `None` for `is_multimodal`.
+
+## [0.3.1] — 2026-09-10 — Discoverability & pre-existing-bug pass
+
+### Added
+
+* `CITATION.cff` — GitHub now shows a "Cite this repository" button and
+  surfaces py-idp in academic dependency graphs.
+* `docs/SECURITY.md` — supported-versions table, private reporting
+  channel, scope, and a 72 h / 14 d SLA for critical issues. Surfaces
+  the GitHub Security tab and enables private vulnerability reports.
+* `.github/ISSUE_TEMPLATE/{bug_report,feature_request,question}.yml`
+  — structured intake; first-time contributors get the right fields
+  on the first try.
+
+### Changed
+
+* README badge row now links to live targets: CI to the Actions page,
+  PyPI/downloads to the package stats, stars to the stargazers page,
+  plus a `Cite this repository` badge for `CITATION.cff`.
+* New README sections: **Security**, **Citing**, **Contributing** —
+  each links to the corresponding repo file.
+* pyproject keywords expanded to cover `rag`, `multimodal`,
+  `information-extraction`, `intelligent-document-processing` so
+  `pip search` and GitHub topic graph pick the project up.
+
+### Fixed
+
+* `tiktoken` is now a real `[project] dependency` (was promised by
+  the README but never declared; fresh installs and CI failed with
+  `ModuleNotFoundError` on `idp.chunker.TokenChunker`).
+* New `[pdf-render]` extra (`pdf2image`, `Pillow`) for the multimodal
+  path (`PdfPagesParser`, `NanonetsVLBackend`); declared in
+  `pyproject.toml`, installed by CI.
+* `.github/workflows/tests.yml` install line now uses
+  `.[dev,eval,api,pdf-render]` so `test_security_adversarial.py`
+  collects cleanly.
+* Six test files no longer hard-code `/Users/hermes/py-idp/...` as
+  the repo path; they derive `REPO` from `Path(__file__)`. Tests now
+  pass on any machine, not just the author's.
+* `PolicyCache.flush_now()` race with the background flusher: a
+  caller that flushes synchronously and then reads the policy file
+  can no longer observe a stray `.tmp` because the flusher re-checks
+  `_dirty.is_set()` inside the lock and skips no-op writes.
+
+## [0.3.0] — 2026-09-02 — Self-hosted VLM backend
+
+### Added
+
+* **`NanonetsVLBackend`** in `idp.llm.nanonets` — self-hosted,
+  offline OCR + extraction via `nanonets/Nanonets-OCR2-3B` (Qwen2.5-VL
+  fine-tune on Hugging Face). No API key, no cloud egress. ~7 GB
+  weights cached at `~/.cache/huggingface/hub/`. Runs on Apple
+  Silicon (MPS) or CUDA. Lazy model load on first `.complete()` call.
+  Configurable `device`, `dtype`, `max_image_side`, `load_in_4bit`.
+
+* **`[hf-vlm]` extra** in `pyproject.toml`:
+  `torch`, `transformers>=4.45`, `accelerate`, `safetensors`,
+  `Pillow`, `huggingface-hub`.
+
+* **Gated by `IDP_ENABLE_NANONETS=1`** to avoid surprise ~7 GB
+  downloads. `get_backend("nanonets")` raises a clear error if the
+  gate is off or `[hf-vlm]` is not installed.
+
+## [0.2.0] — 2026-09-01 — Production hardening
+
+### Added
+
+* **`idp.errors`**: a typed exception hierarchy (`IDPError` base +
+  `ConfigurationError`, `RateLimitedError`, `BackendUnavailableError`,
+  `StorageError`, `DocumentParseError`, `SchemaValidationError`).
+  Catch `IDPError` for framework-level handling without swallowing
+  unrelated exceptions.
+* **`idp.metrics`**: lightweight in-process metrics with thread-safe
+  counters, gauges, histograms, and Prometheus text-format export
+  at `GET /metrics`.
+* **`idp.config`**: validated `Settings` loaded from env. All
+  variables are `IDP_`-prefixed. Bad values raise `ConfigurationError`
+  at startup so misconfigured deployments fail fast instead of at the
+  first request.
+* **`idp.ratelimit`**: per-key + global sliding-window rate limiter
+  (1-minute windows). Raises `RateLimitedError` (→ HTTP 429) when
+  exceeded.
+* **`idp.api`**: production-hardened FastAPI app replacing the
+  `examples/api.py` demo:
+  - `/healthz` (liveness), `/readyz` (readiness), `/version`,
+    `/metrics`, `/extract`
+  - Auth via `X-API-Key` header **or** `Authorization: Bearer …`
+  - `IDP_MAX_UPLOAD_BYTES` enforced via both `Content-Length` header
+  and actual stream read (defends against missing/lying headers)
+  - Structured request logging with metrics
+  - CORS support via `IDP_CORS_ORIGINS` (comma-separated)
+* **`idp._logging`**: `LOG_LEVEL` + `LOG_FORMAT=human|json`
+  configuration helpers.
+
+### Changed
+
+* **Invoice** schema: `invoice_number`, `vendor_name`, `total_amount`
+  are now **required**. Partial extraction still works for everything
+  else.
+* **Contract** schema: `title` is now **required**.
+* **BankStatement** schema: `account_holder` is now **required**.
+* **Document.from_path()** now raises `IsADirectoryError` for
+  directories and `OSError` for non-regular files (FIFOs, sockets,
+  devices) instead of silently returning an empty Document.
+* Bumped to v0.2.0.
+
+### Fixed
+
+* **`_stub` crashed on malformed `enum` values** (dict/set/bool/empty
+  list). Caught by Hypothesis property test. Now falls back to `None`
+  on any non-list enum.
+
+## [0.1.0] — 2026-08
+
+Initial release. Six-stage pipeline (parse → classify → extract →
+assess → validate → HITL), mock + OpenAI-compatible + Anthropic
+backends, in-process queue, JSON + SQLite + in-memory storage,
+human-in-the-loop Streamlit UI, reinforcement-learning policy from
+review feedback.

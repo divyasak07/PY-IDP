@@ -1,0 +1,186 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-idp"
+version = "0.6.2"
+description = "General-purpose, AI-enabled Intelligent Document Processing framework for Python. OCR + multimodal extraction with Pydantic schemas, confidence assessment, HITL review, and a built-in eval harness. Supports OpenAI, Anthropic, Ollama, and 8 China LLMs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+authors = [
+    { name = "Royce", email = "roycelam@umich.edu" },
+]
+keywords = [
+    "intelligent-document-processing",
+    "document-ai",
+    "ocr",
+    "llm",
+    "extraction",
+    "pydantic",
+    "multimodal",
+    "rag",
+    "information-extraction",
+    "invoice",
+    "pdf",
+    "schema-discovery",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "pydantic>=2.5",
+    "typer>=0.12",
+    "rich>=13.7",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "tenacity>=8.2",
+    "streamlit>=1.32",
+    "pdfplumber>=0.10",        # lightweight fallback parser
+    "tiktoken>=0.7",           # token-budget chunking (chunker.TokenChunker, extract optimizer)
+    # Template frontmatter is YAML, and the bundled sample templates now
+    # load automatically (TemplateRegistry.load_with_fallback), so a
+    # default install must be able to parse them. Before v0.6.2 PyYAML was
+    # optional and only needed by users who pointed at their own
+    # templates/ dir -- which meant the shipped samples raised ImportError.
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# PyYAML is a core dependency as of v0.6.2 (the bundled sample templates
+# load by default). This extra is retained as an explicit no-op so the
+# error message in idp.templates and any existing install instructions
+# that say `pip install py-idp[templates]` keep working.
+templates = ["PyYAML>=6.0"]
+# Default parser (IBM Docling). Heavy: ~500MB model deps.
+docling = ["docling>=2.0"]
+# Optional OCR fallback for noisy scans
+ocr = ["pytesseract>=0.3.10", "Pillow>=10.0"]
+# OpenAI-compatible API (also works with Anthropic via compatible gateways)
+openai = ["openai>=1.30"]
+anthropic = ["anthropic>=0.27"]
+ollama = ["ollama>=0.2"]
+# Hugging Face vision-language models (Nanonets-OCR2-3B + Baidu Unlimited-OCR).
+# Heavy: ~3 GB pip install (torch + transformers), ~7 GB model weights.
+# Runs offline on MPS (Apple Silicon) or CUDA. No API key needed.
+hf-vlm = [
+    "torch>=2.1",
+    "transformers>=4.45",
+    "accelerate>=0.34",
+    "safetensors>=0.4",
+    "Pillow>=10.0",
+    "huggingface-hub>=0.24",
+]
+# API server example (FastAPI + uvicorn)
+api = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
+# China LLM providers (OpenAI-compatible; no extra deps required — uses httpx)
+# The `openai` SDK is optional; install it if you prefer the SDK client to raw HTTP.
+china = ["openai>=1.30"]
+# PDF-to-image rendering for multimodal backends (PdfPagesParser + NanonetsVLBackend).
+# Pillow is used for image preprocessing; pdf2image requires poppler-utils at runtime
+# (apt install poppler-utils / brew install poppler).
+pdf-render = ["pdf2image>=1.16", "Pillow>=10.0"]
+# Evaluation
+eval = ["datasets>=2.18", "pandas>=2.1"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-benchmark>=4.0",
+    "hypothesis>=6.80",
+    "httpx>=0.27",  # FastAPI TestClient + integration tests
+    "ruff>=0.3",
+    "mypy>=1.8",
+    "types-PyYAML",
+    "reportlab>=4.0",
+]
+# Building the documentation site (mkdocs-material + mkdocstrings).
+# Not required for running py-idp; only for `mkdocs build` / `mkdocs serve`.
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.25",
+    "pymdown-extensions>=10.7",
+]
+# Running the example notebooks in examples/notebooks/. nbformat/nbconvert are
+# needed for re-executing notebooks; ipykernel to register the Python kernel
+# in Jupyter. pandas is used by the batch notebook's DataFrame cell.
+notebooks = [
+    "nbformat>=5.10",
+    "nbconvert>=7.0",
+    "ipykernel>=6.0",
+    "pandas>=2.1",
+]
+
+[project.scripts]
+idp = "idp.pipeline.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/rollroyces/py-idp"
+Documentation = "https://rollroyces.github.io/py-idp/"
+Issues = "https://github.com/rollroyces/py-idp/issues"
+Changelog = "https://github.com/rollroyces/py-idp/blob/main/CHANGELOG.md"
+# README in non-English languages — PyPI only renders one README per project,
+# so non-English readers land here from the project page sidebar.
+"繁體中文 README" = "https://github.com/rollroyces/py-idp/blob/main/README.zh-TW.md"
+"简体中文 README" = "https://github.com/rollroyces/py-idp/blob/main/README.zh-CN.md"
+"PyPI setup guide" = "https://github.com/rollroyces/py-idp/blob/main/docs/PYPI_SETUP.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Ship the bundled sample templates inside the package so
+# `pip install py-idp` actually gets them. Without this they live only
+# at the repo root (outside src/) and are absent from both the wheel
+# and the sdist, leaving every installed user with an empty
+# TemplateRegistry. `idp.templates` resolves the packaged copies at
+# `importlib.resources` when no IDP_TEMPLATE_DIR / ./templates is set.
+[tool.setuptools.package-data]
+"idp.templates_pkg" = ["*.md"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Jupyter notebooks (examples/notebooks/*.ipynb) are excluded — they have
+# cell-by-cell imports and execution-order quirks that don't fit ruff's
+# module-level model. Use `nbqa ruff` if you want notebook linting.
+extend-exclude = ["examples/notebooks/*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer requires typer.Option/Argument in defaults — B008 is a false positive
+# for any @app.command()-decorated function.
+"src/idp/pipeline/cli.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+# Plain mypy caught 13 real bugs (str→float assignment, dead string-passing
+# code, None-attr crash, SqlStorage/Protocol signature mismatch). These extra
+# flags add the highest-value checks WITHOUT the annotation churn that
+# --strict would force on Typer CLI commands and Streamlit glue code:
+no_implicit_optional = true
+warn_unreachable = true
+warn_redundant_casts = true
+check_untyped_defs = true
+# Optional deps (anthropic, docling, pytesseract) are imported lazily.
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (real-network / real-LLM); skipped by default with `-m 'not slow'`",
+]
